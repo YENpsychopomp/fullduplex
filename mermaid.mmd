@@ -1,0 +1,98 @@
+sequenceDiagram
+
+    participant U as Client (Web/App)
+    participant G as WS Gateway
+    participant S as Session Manager
+    participant A as Audio Processor
+    participant V as VAD
+    participant STT as STT Stream
+    participant LLM as LLM Stream
+    participant TTS as TTS Stream
+    participant Q as Queue Manager
+    participant I as Interrupt Ctrl
+
+    %% =====================
+    %% Connect
+    %% =====================
+
+    U->>G: WebSocket Connect (session_id, token)
+    G->>S: create / attach session
+    S-->>G: ok
+    G-->>U: 101 Switching Protocols
+
+    %% =====================
+    %% Audio Input Loop
+    %% =====================
+
+    loop audio stream
+        U->>G: binary audio chunk
+        G->>S: forward audio
+        S->>A: decode / resample
+        A->>V: audio frame
+        V-->>S: speech / silence
+
+        S->>STT: stream audio
+        STT-->>S: partial text
+        S->>Q: append text buffer
+    end
+
+    %% =====================
+    %% Silence trigger
+    %% =====================
+
+    V-->>S: silence > threshold
+
+    S->>Q: finalize text
+    Q-->>S: text
+
+    S->>LLM: send prompt (history + text)
+
+    %% =====================
+    %% LLM streaming
+    %% =====================
+
+    loop token stream
+
+        LLM-->>S: token delta
+        S->>Q: append token
+
+        S->>Q: phrase detect
+        Q-->>S: phrase ready
+
+        S->>TTS: send phrase
+
+        TTS-->>S: audio chunk
+
+        S->>Q: push audio
+
+        Q-->>G: audio chunk
+        G-->>U: binary audio
+
+    end
+
+    %% =====================
+    %% Interrupt
+    %% =====================
+
+    U->>G: new audio (user speak)
+
+    G->>S: interrupt
+
+    S->>I: cancel request
+
+    I->>LLM: cancel
+    I->>TTS: cancel
+    I->>Q: clear audio
+    I->>Q: clear token
+
+    I-->>S: done
+
+    S-->>U: stop audio
+
+    %% =====================
+    %% Continue conversation
+    %% =====================
+
+    loop next turn
+        U->>G: audio
+    end

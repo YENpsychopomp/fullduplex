@@ -1,0 +1,6 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+aiortc>=1.6
+numpy>=1.26
+requests>=2.31
+openai>=1.40

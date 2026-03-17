@@ -1,0 +1,76 @@
+<!-- frontend/full_duplex.html -->
+<!DOCTYPE html>
+<html lang="zh-Hant">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>全雙工語音通話</title>
+		<link
+			href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css"
+			rel="stylesheet">
+		<link href="style.css" rel="stylesheet" />
+	</head>
+	<body>
+
+		<div class="call-container">
+			<div class="header">
+				<h2>全雙工語音通話</h2>
+				<div class="status" id="call-status">準備就緒</div>
+
+				<div class="meta" aria-live="polite">
+					<div class="pill" id="ws-pill" data-state="warn" title="WebSocket 連線狀態">
+						<span class="dot" aria-hidden="true"></span>
+						<span id="ws-text">連線中</span>
+					</div>
+					<div class="pill" id="mic-pill" data-state="warn" title="麥克風狀態">
+						<span class="dot" aria-hidden="true"></span>
+						<span id="mic-text">未開始</span>
+					</div>
+				</div>
+
+				<div class="system-prompt">
+					<label for="system-prompt">備註（System Prompt）</label>
+					<textarea
+						id="system-prompt"
+						rows="2"
+						placeholder="輸入 system prompt（會在後續送給後端做系統提示用）"></textarea>
+				</div>
+
+				<div class="system-prompt">
+					<label for="user-session">UUID（如果有的話）</label>
+					<textarea
+						id="user-session"
+						rows="2"
+						placeholder="輸入 Session UUID(系統會根據此uuid取得對話紀錄)"></textarea>
+				</div>
+			</div>
+
+			<div class="avatar-area">
+				<div class="avatar" id="avatar">
+					<i class="fas fa-microphone-alt"></i>
+				</div>
+
+				<div class="wave-container" id="visualizer">
+					<!-- 聲音波形 -->
+				</div>
+
+				<div class="helper" id="helper-text">
+					點擊電話按鈕開始；若後端未啟動，狀態會顯示為連線失敗。
+				</div>
+			</div>
+
+			<div class="controls">
+				<button class="btn btn-mic" id="btn-mute" title="靜音/取消靜音" aria-label="靜音"
+					disabled>
+					<i class="fas fa-microphone"></i>
+				</button>
+				<button class="btn btn-call" id="btn-toggle-call" title="開始通話"
+					aria-label="開始通話">
+					<i class="fas fa-phone"></i>
+				</button>
+			</div>
+		</div>
+
+		<script src="index.js"></script>
+	</body>
+</html>
