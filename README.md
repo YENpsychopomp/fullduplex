@@ -1,40 +1,140 @@
 # full-duplexV3
 
-最小可跑的「user → STT → LLM → TTS → user」語音助理 Web Demo：
-- 前端：麥克風音訊以 **WebRTC** 串流到後端
-- 後端：FastAPI + **aiortc** 接收音訊，並以 WebSocket 即時下發 STT 事件（目前 STT 為 stub）
+以瀏覽器麥克風串流到後端，實作語音助理 Demo 的最小可跑版本。
 
-## 需求
+目前主流程：
+1. 前端用 MediaRecorder 採集 Opus 音訊並透過 WebSocket 持續送出
+2. 後端以 VAD 概念判斷語句結束
+3. 後端呼叫 Groq STT 轉文字
+4. 後端回傳 STT 結果給前端
+
+## 目前能力
+
+- WebSocket Session 建立與重連（可指定既有 session）
+- 前端 Opus 串流上傳（100ms chunk）
+- 後端 SessionState 管理（dataclass）
+- 後端 VAD + STT（Groq Whisper）
+- 前端即時顯示 STT 狀態與結果
+
+## 專案結構
+
+- backend/main.py：FastAPI + WebSocket + VAD/STT
+- backend/requirements.txt：Python 套件
+- frontend/index.html：頁面結構
+- frontend/index.js：WS 連線、錄音、UI 狀態
+- frontend/style.css：樣式
+
+## 執行需求
+
 - Python 3.10+
+- FFmpeg（PyDub 解碼需要）
+- 可用的 Groq API Key
+- 可用的 Azure OpenAI 設定（目前程式已初始化 LLM client）
 
-## 啟動
-在專案根目錄：
+## 安裝與啟動
+
+在專案根目錄執行：
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r backend\requirements.txt
+
+# 若 requirements 尚未包含以下套件，請另外安裝
+pip install python-dotenv pydub langchain-openai langchain-core langchain
+```
+
+啟動後端（兩種方式擇一）：
+
+```powershell
+# 在專案根目錄
 uvicorn backend.main:app --reload --port 8000
 ```
 
-打開：
+```powershell
+# 或在 backend 目錄
+uvicorn main:app --reload --port 8000
+```
+
+開啟：
+
 - http://localhost:8000/
 
-測試方式：
-- 輸入「房間 ID」（等同 sessionId），按「開始說話」開始串流
-- 前端會透過 WS 收到 `stt.partial`（即時逐字稿事件）並更新畫面
-- 按「停止」會中斷串流
+## 必要環境變數
 
-## 注意事項
-- 本版 Demo 走 WebRTC(user↔server) 音訊串流，WebSocket 只用於下發事件。
-- `aiortc` 在部分環境安裝可能需要編譯相依套件；若安裝失敗，先確認 Python 版本與 pip wheel 支援。
-- 麥克風權限通常需要安全來源（HTTPS）。`localhost` 一般被視為安全來源。
+在 backend/.env 設定：
 
-## 檔案
-- backend/main.py：HTTP API（`/api/voice`, `/api/chat`）+ 靜態頁面
-- frontend/index.html / frontend/index.js：WebRTC 串流 → WS 收 STT 事件 + UI
-- frontend/style.css：樣式
+```env
+GROQ_API_KEY=your_groq_api_key
+GROQ_API_URL=https://api.groq.com/openai/v1/audio/transcriptions
+GROQ_STT_MODEL=whisper-large-v3-turbo
 
-## API（目前用到）
-- `POST /api/webrtc/offer`：WebRTC offer/answer（前端送 offer SDP，後端回 answer SDP）
-- `WS /ws/{session_id}/{client_id}`：事件通道（例如 `stt.partial`）
+AZURE_OPENAI_ENDPOINT=...
+AZURE_OPENAI_API_KEY=...
+AZURE_OPENAI_CHAT_DEPLOYMENT_NAME=...
+OPENAI_API_VERSION=...
+
+# VAD / STT 參數（可選）
+STT_SILENCE_SECONDS=1.2
+STT_MIN_AUDIO_BYTES=2048
+VAD_SILENCE_TIMEOUT=1.0
+VAD_ENERGY_THRESHOLD=-40
+```
+
+## WebSocket API
+
+### 建立新 session
+
+- 路徑：/ws/{system_prompt}
+
+### 連線既有 session
+
+- 路徑：/ws/{session}/{system_prompt}
+
+### 前端送出
+
+- binary：Opus 音訊片段
+- text(JSON)：
+	- {"type":"ping"}
+
+### 後端回傳
+
+- {"type":"session","session":"..."}
+- {"type":"pong","session":"...","ts":"..."}
+- {"type":"stt.started","session":"..."}
+- {"type":"stt.result","session":"...","text":"..."}
+- {"type":"stt.error","session":"...","message":"..."}
+
+## 前端操作流程
+
+1. 開啟頁面
+2. 可輸入 system prompt 與既有 session（可選）
+3. 按下通話按鈕開始串流
+4. 說話後停頓，後端觸發 STT
+5. 在畫面上查看 STT 結果
+
+## 常見問題
+
+### 1) uvicorn 無法啟動
+
+- 先確認你在正確目錄執行
+- 若在 backend 目錄，請用 uvicorn main:app --reload --port 8000
+- 若在專案根目錄，請用 uvicorn backend.main:app --reload --port 8000
+
+### 2) STT 400 Bad Request
+
+- 檢查 GROQ_API_KEY 是否正確
+- 檢查音訊是否有實際收進來（瀏覽器麥克風權限）
+- 降低 VAD_ENERGY_THRESHOLD（例如 -45 或 -50）重試
+
+### 3) 沒有 STT 結果
+
+- 說話後停頓至少 VAD_SILENCE_TIMEOUT 秒
+- 檢查 STT_MIN_AUDIO_BYTES 是否過大
+- 檢查 FFmpeg 是否已安裝並可被系統找到
+
+## 下一步建議
+
+- 接上 llm.result 與 tts.result 的完整雙向語音回路
+- 將 session 路由改為 query 參數承載 system prompt，避免 path encode 問題
+- 補上結構化 logger（session_id、msg.type、latency）

@@ -43,9 +43,13 @@ const wsUrl = (sessionOverride, systemPrompt) => {
     const isHttps = window.location.protocol === "https:";
     const proto = isHttps ? "wss" : "ws";
     if (sessionOverride) {
-        return `${proto}://${window.location.host}/ws/${encodeURIComponent(sessionOverride)}/${encodeURIComponent(systemPrompt)}`;
+        return `${proto}://${window.location.host}/ws/${
+            encodeURIComponent(sessionOverride)
+        }/${encodeURIComponent(systemPrompt)}`;
     }
-    return `${proto}://${window.location.host}/ws/${encodeURIComponent(systemPrompt)}`;
+    return `${proto}://${window.location.host}/ws/${
+        encodeURIComponent(systemPrompt)
+    }`;
 };
 
 const closeWs = () => {
@@ -184,7 +188,7 @@ function startHeartbeat() {
             console.log("Ping...");
             ws.send(JSON.stringify({ type: "ping" }));
         }
-    }, 30000); 
+    }, 30000);
 }
 
 function stopHeartbeat() {
@@ -203,7 +207,13 @@ const connectWs = () => {
                 console.log(`Using user session from input: ${desiredSession}`);
                 ws = new WebSocket(wsUrl(desiredSession, systemPrompt));
             } else {
-                ws = new WebSocket(wsUrl(null, systemPrompt || "你是一個友善的語音助理，協助使用者解決問題。"));
+                ws = new WebSocket(
+                    wsUrl(
+                        null,
+                        systemPrompt ||
+                            "你是一個友善的語音助理，協助使用者解決問題。",
+                    ),
+                );
             }
         } catch (e) {
             ws = null;
@@ -270,7 +280,9 @@ const connectWs = () => {
             }
 
             if (msg.type === "error") {
-                const message = typeof msg.message === "string" ? msg.message : "ws error";
+                const message = typeof msg.message === "string"
+                    ? msg.message
+                    : "ws error";
                 if (!settled) {
                     settled = true;
                     window.clearTimeout(timeout);
@@ -292,15 +304,21 @@ const connectWs = () => {
             }
 
             if (msg.type === "stt.result") {
-                const text = typeof msg.text === "string" ? msg.text.trim() : "";
+                const text = typeof msg.text === "string"
+                    ? msg.text.trim()
+                    : "";
                 console.log("STT result:", text);
                 setCallStatus("STT 完成");
-                setText(helperTextEl, text ? `STT: ${text}` : "STT 完成（無文字）");
-                
+                setText(
+                    helperTextEl,
+                    text ? `STT: ${text}` : "STT 完成（無文字）",
+                );
             }
 
             if (msg.type === "stt.error") {
-                const message = typeof msg.message === "string" ? msg.message : "stt error";
+                const message = typeof msg.message === "string"
+                    ? msg.message
+                    : "stt error";
                 console.warn("STT error:", message);
                 setCallStatus("STT 失敗");
                 setText(helperTextEl, `STT 錯誤: ${message}`);
@@ -435,7 +453,10 @@ btnToggleCall?.addEventListener("click", async () => {
         setPillState(micPillEl, "warn", micTextEl, "未開始");
         setCallStatus("通話已結束");
         session = null;
-        setText(helperTextEl, "點擊電話按鈕開始；若後端未啟動，狀態會顯示為連線失敗。");
+        setText(
+            helperTextEl,
+            "點擊電話按鈕開始；若後端未啟動，狀態會顯示為連線失敗。",
+        );
         setButtons();
     }
 });
@@ -444,7 +465,8 @@ btnMute?.addEventListener("click", () => {
     if (!callActive) return;
     micMuted = !micMuted;
     try {
-        const track = audioTrack || mediaStream?.getAudioTracks?.()?.[0] || null;
+        const track = audioTrack || mediaStream?.getAudioTracks?.()?.[0] ||
+            null;
         if (track) track.enabled = !micMuted;
     } catch {}
     setPillState(

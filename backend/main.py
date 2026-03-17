@@ -16,12 +16,25 @@ from dotenv import load_dotenv
 import time
 from pydub import AudioSegment
 from pydub.utils import mediainfo
+from langchain_openai import AzureChatOpenAI
+from langchain.agents import create_agent
+from langchain_core.messages import HumanMessage, AIMessage
 
 
 load_dotenv()
 
 app = FastAPI(title="full-duplexV3", version="0.1.0")
 logger = logging.getLogger("uvicorn.error")
+llm = AzureChatOpenAI(
+    azure_deployment=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"),
+    temperature=0.7,
+    max_tokens=None,
+    timeout=None,
+    max_retries=2,
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_version=os.getenv("OPENAI_API_VERSION"),
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+)
 
 GROQ_API_URL = os.getenv(
     "GROQ_API_URL",
@@ -31,20 +44,6 @@ GROQ_API_URL = os.getenv(
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     logger.warning("GROQ_API_KEY not found in environment variables")
-
-#  AzureOpenAI API 設定（環境變數）
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-
-if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_API_KEY:
-    logger.warning("Azure OpenAI credentials not found in environment variables")
-
-llm_client = AzureOpenAI(
-    api_version="2025-01-01-preview",
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_key=AZURE_OPENAI_API_KEY,
-) if AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY else None
 
 # === 固定 TTS 音色與輸出格式 ===
 # 音色固定（依需求）：zh-TW-YunJheNeural
@@ -301,7 +300,7 @@ async def _vad_stt_loop(ws: WebSocket, session_id: uuid.UUID, system_prompt: str
                     # 清空 Buffer，準備接聽下一句話
                     session_manager.clear_audio_buffer(session_id)
                     session_manager.set_prompt_context(session_id, text)
-
+                    logger.info(f"STT result for session {session_id}: {text[:200]}")
                     await ws.send_text(json.dumps({
                         "type": "stt.result",
                         "session": str(session_id),
