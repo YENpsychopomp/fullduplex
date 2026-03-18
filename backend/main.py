@@ -203,6 +203,7 @@ class SessionState:
     last_speech_time: float = 0.0
     is_speaking: bool = False
     history: list[HumanMessage | AIMessage] = field(default_factory=list)
+    llm_speacking: bool = False
         
 class SessionManager:
     """
@@ -378,7 +379,15 @@ class SessionManager:
     
     def session_exists(self, session_id: uuid.UUID) -> bool:
         return session_id in self.sessions
-            
+    
+    def get_session_llm_speaking(self, session_id: uuid.UUID) -> bool:
+        state = self.sessions.get(session_id)
+        return state.llm_speacking if state else False
+    
+    def set_session_llm_speaking(self, session_id: uuid.UUID, speaking: bool) -> None:
+        state = self.sessions.get(session_id)
+        if state:
+            state.llm_speacking = speaking
 
 session_manager = SessionManager()
 session_cleanup_task: Optional[asyncio.Task] = None
@@ -499,6 +508,7 @@ async def _send_tts_audio_via_ws(ws: WebSocket, session_id: uuid.UUID) -> None:
         pass
     finally:
         session_manager.clear_tts_audio_buffer(session_id)
+        session_manager.set_session_llm_speaking(session_id, False)
 
 
 def _transcribe_audio_bytes(audio_bytes: bytes, ext: str, prompt: str = "") -> dict:
@@ -610,6 +620,7 @@ async def _process_ai_pipeline(
 ) -> None:
     try:
         # === 1. STT 階段 ===
+        session_manager.set_session_llm_speaking(session_id, True)
         result = await asyncio.to_thread(_transcribe_audio_bytes, audio_bytes, ext, combined_prompt)
         text = result.get("text", "").strip()
         
@@ -681,7 +692,8 @@ async def _vad_stt_loop(ws: WebSocket, session_id: uuid.UUID, system_prompt: str
         is_speaking, last_speech = session_manager.get_vad_state(session_id, current_time)
         silence_duration = current_time - last_speech
         current_buffer_size = session_manager.get_buffer_size(session_id)
-        if is_speaking and silence_duration >= VAD_SILENCE_TIMEOUT:
+        llm_speaking = session_manager.get_session_llm_speaking(session_id)
+        if is_speaking and silence_duration >= VAD_SILENCE_TIMEOUT and not llm_speaking:
             session_manager.reset_speaking(session_id)
 
             await _safe_ws_send(ws, {"type": "stt.started", "session": str(session_id)})
@@ -689,7 +701,6 @@ async def _vad_stt_loop(ws: WebSocket, session_id: uuid.UUID, system_prompt: str
             context_text = session_manager.get_prompt_context(session_id)
             combined_prompt = f"{system_prompt} {context_text}".strip()
 
-            # 🔥 關鍵修正：將整個耗時流程丟入背景執行，讓 VAD 迴圈立刻回到上方繼續監聽！
             asyncio.create_task(
                 _process_ai_pipeline(
                     ws, session_id, audio_bytes, ext, combined_prompt, system_prompt, current_buffer_size
@@ -702,15 +713,7 @@ async def _ws_loop(ws: WebSocket, session_id: uuid.UUID, system_prompt: str) -> 
     """
     session_manager.open_session(session_id, system_prompt)
     logger.info(f"New WebSocket connection: session {session_id} created with system prompt: {system_prompt}")
-    await ws.send_text(
-        json.dumps(
-            {
-                "type": "session",
-                "session": str(session_id),
-            },
-            ensure_ascii=False,
-        )
-    )
+    await _safe_ws_send(ws, {"type": "session", "session": str(session_id)})
 
     # STT 改由後端固定週期觸發，不再由前端控制。
     session_manager.set_stt_task(session_id, asyncio.create_task(_vad_stt_loop(ws, session_id, system_prompt)))
@@ -743,22 +746,11 @@ async def _ws_loop(ws: WebSocket, session_id: uuid.UUID, system_prompt: str) -> 
             try:
                 msg = json.loads(data_text)
             except json.JSONDecodeError:
-                await ws.send_text(
-                    json.dumps({"type": "error", "message": "invalid json"}, ensure_ascii=False)
-                )
+                await _safe_ws_send(ws, {"type": "error", "message": "invalid json"})
                 continue
             # 處理 ping 消息，回應 pong
             if isinstance(msg, dict) and msg.get("type") == "ping":
-                await ws.send_text(
-                    json.dumps(
-                        {
-                            "type": "pong",
-                            "session": str(session_id),
-                            "ts": datetime.now().isoformat(),
-                        },
-                        ensure_ascii=False,
-                    )
-                )
+                await _safe_ws_send(ws, {"type": "pong", "session": str(session_id), "ts": datetime.now().isoformat()})
                 continue
 
     except WebSocketDisconnect:
@@ -793,10 +785,7 @@ async def ws_existing_session(ws: WebSocket, session_id: str) -> None:
     try:
         uid = uuid.UUID(session_id)
     except Exception:
-        await ws.send_text(json.dumps(
-            {"type": "error", "message": "invalid session uuid"},
-            ensure_ascii=False
-        ))
+        await _safe_ws_send(ws, {"type": "error", "message": f"invalid session uuid: {session_id}"})
         await ws.close(code=1008)
         return
 
@@ -807,10 +796,7 @@ async def ws_existing_session(ws: WebSocket, session_id: str) -> None:
         system_prompt = "你是一個有用的助手"
     session_exists = session_manager.session_exists(uid)
     if not session_exists:
-        await ws.send_text(json.dumps(
-            {"type": "resume.error", "message": f"session {session_id} not found for resuming"},
-            ensure_ascii=False
-        ))
+        await _safe_ws_send(ws, {"type": "resume.error", "message": f"session {session_id} not found for resuming"})
         await ws.close(code=1008)
         return
     await _ws_loop(ws, uid, system_prompt)
