@@ -6,7 +6,8 @@
 1. 前端用 MediaRecorder 採集 Opus 音訊並透過 WebSocket 持續送出
 2. 後端以 VAD 概念判斷語句結束
 3. 後端呼叫 Groq STT 轉文字
-4. 後端回傳 STT 結果給前端
+4. 後端呼叫 Azure OpenAI 產生 LLM 回覆
+5. 後端回傳 STT 與 LLM 結果給前端
 
 ## 目前能力
 
@@ -14,7 +15,8 @@
 - 前端 Opus 串流上傳（100ms chunk）
 - 後端 SessionState 管理（dataclass）
 - 後端 VAD + STT（Groq Whisper）
-- 前端即時顯示 STT 狀態與結果
+- 後端 LLM 回覆（Azure OpenAI）
+- 前端即時顯示 STT / LLM 狀態與結果
 
 ## 專案結構
 
@@ -104,6 +106,9 @@ VAD_ENERGY_THRESHOLD=-40
 - {"type":"stt.started","session":"..."}
 - {"type":"stt.result","session":"...","text":"..."}
 - {"type":"stt.error","session":"...","message":"..."}
+- {"type":"llm.started","session":"..."}
+- {"type":"llm.result","session":"...","text":"..."}
+- {"type":"llm.error","session":"...","message":"..."}
 
 ## 前端操作流程
 
@@ -135,6 +140,6 @@ VAD_ENERGY_THRESHOLD=-40
 
 ## 下一步建議
 
-- 接上 llm.result 與 tts.result 的完整雙向語音回路
+- 接上 tts.result 的完整雙向語音回路
 - 將 session 路由改為 query 參數承載 system prompt，避免 path encode 問題
 - 補上結構化 logger（session_id、msg.type、latency）

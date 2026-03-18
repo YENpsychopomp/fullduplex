@@ -44,11 +44,14 @@ sequenceDiagram
 
     S->>Q: finalize text
     Q-->>S: text
+    S-->>U: stt.result(text)
 
     S->>LLM: send prompt (history + text)
+    LLM-->>S: llm.result(text)
+    S-->>U: llm.result(text)
 
     %% =====================
-    %% LLM streaming
+    %% LLM streaming (未實作)
     %% =====================
 
     loop token stream

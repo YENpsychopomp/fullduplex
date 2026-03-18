@@ -24,8 +24,46 @@ let heartbeatInterval = null;
 let mediaStream = null;
 let mediaRecorder = null;
 let audioTrack = null;
+let ttsIncoming = {
+    active: false,
+    chunks: [],
+    mime: "audio/webm",
+    ext: ".webm",
+    expectedSize: 0,
+};
 
 const OPUS_CHUNK_MS = 100;
+
+const mimeByExt = (ext) => {
+    if (ext === ".webm") return "audio/webm";
+    if (ext === ".ogg") return "audio/ogg";
+    if (ext === ".mp3") return "audio/mpeg";
+    return "application/octet-stream";
+};
+
+const resetIncomingTts = () => {
+    ttsIncoming.active = false;
+    ttsIncoming.chunks = [];
+    ttsIncoming.mime = "audio/webm";
+    ttsIncoming.ext = ".webm";
+    ttsIncoming.expectedSize = 0;
+};
+
+const playIncomingTts = async () => {
+    if (!ttsIncoming.chunks.length) return;
+    const blob = new Blob(ttsIncoming.chunks, {
+        type: ttsIncoming.mime || mimeByExt(ttsIncoming.ext),
+    });
+    const url = URL.createObjectURL(blob);
+    try {
+        const audio = new Audio(url);
+        await audio.play();
+    } catch (e) {
+        console.warn("TTS audio autoplay failed", e);
+    } finally {
+        window.setTimeout(() => URL.revokeObjectURL(url), 5000);
+    }
+};
 
 // ===== 小工具 =====
 const setText = (el, text) => {
@@ -39,17 +77,14 @@ const setPillState = (pillEl, state, textEl, text) => {
 
 const setCallStatus = (text) => setText(callStatusEl, text);
 
-const wsUrl = (sessionOverride, systemPrompt) => {
+const wsUrl = (sessionOverride) => {
     const isHttps = window.location.protocol === "https:";
     const proto = isHttps ? "wss" : "ws";
     if (sessionOverride) {
-        return `${proto}://${window.location.host}/ws/${
-            encodeURIComponent(sessionOverride)
-        }/${encodeURIComponent(systemPrompt)}`;
+        return `${proto}://${window.location.host}/ws/resume/${encodeURIComponent(sessionOverride)}`;
     }
-    return `${proto}://${window.location.host}/ws/${
-        encodeURIComponent(systemPrompt)
-    }`;
+    // 否則走建立新會話的路由 (網址裡面不再需要 systemPrompt)
+    return `${proto}://${window.location.host}/ws/new`;
 };
 
 const closeWs = () => {
@@ -57,7 +92,7 @@ const closeWs = () => {
     stopHeartbeat();
     try {
         ws.close();
-    } catch {}
+    } catch { }
     ws = null;
     session = null;
 };
@@ -145,7 +180,7 @@ function stopRecording() {
                 for (const track of mediaStream.getTracks()) {
                     try {
                         track.stop();
-                    } catch {}
+                    } catch { }
                 }
                 mediaStream = null;
             }
@@ -174,7 +209,7 @@ function stopRecording() {
 
             try {
                 recorder.requestData();
-            } catch {}
+            } catch { }
             recorder.stop();
         } catch {
             cleanupTracks();
@@ -201,19 +236,13 @@ function stopHeartbeat() {
 const connectWs = () => {
     return new Promise((resolve, reject) => {
         const desiredSession = (userSessionEl?.value || "").trim();
-        const systemPrompt = (systemPromptEl?.value || "").trim();
+        const systemPrompt = (systemPromptEl?.value || "").trim() || "你是一個友善的語音助理，協助使用者解決問題。";
         try {
             if (desiredSession) {
                 console.log(`Using user session from input: ${desiredSession}`);
-                ws = new WebSocket(wsUrl(desiredSession, systemPrompt));
+                ws = new WebSocket(wsUrl(desiredSession));
             } else {
-                ws = new WebSocket(
-                    wsUrl(
-                        null,
-                        systemPrompt ||
-                            "你是一個友善的語音助理，協助使用者解決問題。",
-                    ),
-                );
+                ws = new WebSocket(wsUrl());
             }
         } catch (e) {
             ws = null;
@@ -227,13 +256,16 @@ const connectWs = () => {
             settled = true;
             try {
                 ws?.close();
-            } catch {}
+            } catch { }
             ws = null;
             reject(new Error("ws timeout"));
         }, 6000);
 
         ws.onopen = () => {
             setPillState(wsPillEl, "warn", wsTextEl, "等待 session…");
+            ws.send(JSON.stringify({
+                system_prompt: systemPrompt
+            }));
         };
 
         ws.onerror = () => {
@@ -260,6 +292,20 @@ const connectWs = () => {
         };
 
         ws.onmessage = (event) => {
+            if (event.data instanceof Blob) {
+                if (ttsIncoming.active) {
+                    ttsIncoming.chunks.push(event.data);
+                }
+                return;
+            }
+
+            if (event.data instanceof ArrayBuffer) {
+                if (ttsIncoming.active) {
+                    ttsIncoming.chunks.push(new Blob([event.data]));
+                }
+                return;
+            }
+
             let msg;
             try {
                 msg = JSON.parse(event.data);
@@ -288,7 +334,22 @@ const connectWs = () => {
                     window.clearTimeout(timeout);
                     try {
                         ws?.close();
-                    } catch {}
+                    } catch { }
+                    ws = null;
+                    reject(new Error(message));
+                }
+            }
+
+            if (msg.type === "resume.error") {
+                const message = typeof msg.message === "string"
+                    ? msg.message
+                    : "ws resume error";
+                if (!settled) {
+                    settled = true;
+                    window.clearTimeout(timeout);
+                    try {
+                        ws?.close();
+                    } catch { }
                     ws = null;
                     reject(new Error(message));
                 }
@@ -313,6 +374,71 @@ const connectWs = () => {
                     helperTextEl,
                     text ? `STT: ${text}` : "STT 完成（無文字）",
                 );
+            }
+
+            if (msg.type === "llm.started") {
+                console.log("LLM started");
+                setCallStatus("LLM 生成中…");
+            }
+
+            if (msg.type === "llm.result") {
+                const text = typeof msg.text === "string"
+                    ? msg.text.trim()
+                    : "";
+                console.log("LLM result:", text);
+                setCallStatus("LLM 完成");
+                setText(
+                    helperTextEl,
+                    text ? `LLM: ${text}` : "LLM 完成（無文字）",
+                );
+            }
+
+            if (msg.type === "llm.error") {
+                const message = typeof msg.message === "string"
+                    ? msg.message
+                    : "llm error";
+                console.warn("LLM error:", message);
+                setCallStatus("LLM 失敗");
+                setText(helperTextEl, `LLM 錯誤: ${message}`);
+            }
+
+            if (msg.type === "tts.started") {
+                const ext = typeof msg.ext === "string" ? msg.ext : ".webm";
+                const mime = typeof msg.mime === "string"
+                    ? msg.mime
+                    : mimeByExt(ext);
+                resetIncomingTts();
+                ttsIncoming.active = true;
+                ttsIncoming.ext = ext;
+                ttsIncoming.mime = mime;
+                ttsIncoming.expectedSize = Number(msg.size || 0);
+                setCallStatus("語音合成回傳中…");
+            }
+
+            if (msg.type === "tts.completed") {
+                const audioSize = ttsIncoming.chunks.reduce(
+                    (sum, chunk) => sum + (chunk.size || 0),
+                    0,
+                );
+                setCallStatus("播放回覆語音");
+                setText(
+                    helperTextEl,
+                    `TTS 音訊已接收 (${audioSize} bytes)` +
+                    (ttsIncoming.expectedSize
+                        ? ` / 預期 ${ttsIncoming.expectedSize} bytes`
+                        : ""),
+                );
+                playIncomingTts().finally(() => resetIncomingTts());
+            }
+
+            if (msg.type === "tts.error") {
+                const message = typeof msg.message === "string"
+                    ? msg.message
+                    : "tts error";
+                console.warn("TTS error:", message);
+                setCallStatus("TTS 失敗");
+                setText(helperTextEl, `TTS 錯誤: ${message}`);
+                resetIncomingTts();
             }
 
             if (msg.type === "stt.error") {
@@ -468,7 +594,7 @@ btnMute?.addEventListener("click", () => {
         const track = audioTrack || mediaStream?.getAudioTracks?.()?.[0] ||
             null;
         if (track) track.enabled = !micMuted;
-    } catch {}
+    } catch { }
     setPillState(
         micPillEl,
         micMuted ? "warn" : "ok",
