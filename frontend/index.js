@@ -19,6 +19,9 @@ let visualizerTimer = null;
 let ws = null;
 let session = null;
 let heartbeatInterval = null;
+let recorder = null;
+let recordInterval = null;
+let currentAudio = null; // 加在檔案前方的全域變數區
 
 // ===== Audio streaming =====
 let mediaStream = null;
@@ -49,20 +52,43 @@ const resetIncomingTts = () => {
     ttsIncoming.expectedSize = 0;
 };
 
-const playIncomingTts = async () => {
-    if (!ttsIncoming.chunks.length) return;
-    const blob = new Blob(ttsIncoming.chunks, {
-        type: ttsIncoming.mime || mimeByExt(ttsIncoming.ext),
+const playIncomingTts = () => {
+    return new Promise((resolve) => {
+        if (!ttsIncoming.chunks.length) {
+            resolve();
+            return;
+        }
+
+        const blob = new Blob(ttsIncoming.chunks, { type: ttsIncoming.mime });
+        const url = URL.createObjectURL(blob);
+
+        // 如果有正在播放的聲音，先停止它
+        if (currentAudio) {
+            currentAudio.pause();
+            currentAudio = null;
+        }
+
+        currentAudio = new Audio(url);
+
+        // 🌟 關鍵：只有播完才會觸發 resolve
+        currentAudio.onended = () => {
+            URL.revokeObjectURL(url);
+            console.log("Audio playback finished.");
+            resolve();
+        };
+
+        // 容錯處理：如果播放失敗，也要 resolve 否則程式會卡死在那
+        currentAudio.onerror = (e) => {
+            console.error("Audio error:", e);
+            URL.revokeObjectURL(url);
+            resolve();
+        };
+
+        currentAudio.play().catch(err => {
+            console.error("Playback blocked by browser:", err);
+            resolve();
+        });
     });
-    const url = URL.createObjectURL(blob);
-    try {
-        const audio = new Audio(url);
-        await audio.play();
-    } catch (e) {
-        console.warn("TTS audio autoplay failed", e);
-    } finally {
-        window.setTimeout(() => URL.revokeObjectURL(url), 5000);
-    }
 };
 
 // ===== 小工具 =====
@@ -102,118 +128,56 @@ async function startRecording() {
         throw new Error("ws not open");
     }
 
-    // Clean up any previous recording state (defensive).
-    stopRecording();
+    await stopRecording();
 
-    if (!navigator.mediaDevices?.getUserMedia) {
-        throw new Error("getUserMedia not supported");
-    }
-
-    mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-            channelCount: 1,
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-        },
-        video: false,
+    // 🌟 初始化 Recorder (使用你參考文獻的設定，改為你需要的 24000Hz)
+    // 注意：必須設定 compiling: true 才能邊錄邊傳
+    recorder = new Recorder({
+        sampleBits: 16,        // 16-bit
+        sampleRate: 24000,     // 24000Hz (需與後端 pydub 設定一致)
+        numChannels: 1,        // 單聲道
+        compiling: true        // 允許即時獲取 PCM 數據
     });
 
-    audioTrack = mediaStream.getAudioTracks()[0] || null;
-    if (audioTrack) {
-        audioTrack.enabled = !micMuted;
-    }
-
-    // Prefer Opus (WebM) then Opus (Ogg). Browser-dependent.
-    const candidates = [
-        "audio/webm;codecs=opus",
-        "audio/ogg;codecs=opus",
-    ];
-    let mimeType = "";
-    for (const c of candidates) {
-        if (window.MediaRecorder?.isTypeSupported?.(c)) {
-            mimeType = c;
-            break;
-        }
-    }
-
-    if (!window.MediaRecorder) {
-        throw new Error("MediaRecorder not supported");
-    }
-
     try {
-        mediaRecorder = mimeType
-            ? new MediaRecorder(mediaStream, { mimeType })
-            : new MediaRecorder(mediaStream);
-    } catch (e) {
-        mediaRecorder = null;
-        throw e;
+        // 請求麥克風權限並開始錄音
+        await recorder.start();
+        console.log("🎤 錄音已開始 (24kHz, 16-bit PCM)");
+
+        // 🌟 設定定時器，每 100 毫秒抓取一次新的 PCM 數據送給後端
+        recordInterval = setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN && !micMuted) {
+                // getNextData() 回傳 PCM ArrayBuffer
+                let pcmData = recorder.getNextData();
+                if (pcmData && pcmData.byteLength > 0) {
+                    // 單純傳送 ArrayBuffer，WebSocket 會自動以 Binary Frame 送出
+                    ws.send(pcmData);
+                }
+            }
+        }, 100);
+
+    } catch (error) {
+        console.error("麥克風啟動失敗或被拒絕:", error);
+        throw error;
     }
-
-    mediaRecorder.ondataavailable = (event) => {
-        if (!event?.data || event.data.size === 0) return;
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-        // Send Opus container bytes as binary.
-        try {
-            ws.send(event.data);
-        } catch (e) {
-            console.warn("ws.send failed", e);
-        }
-    };
-
-    mediaRecorder.onerror = (event) => {
-        console.warn("MediaRecorder error", event);
-    };
-
-    mediaRecorder.start(OPUS_CHUNK_MS);
 }
 
 function stopRecording() {
-    const recorder = mediaRecorder;
-    mediaRecorder = null;
-    audioTrack = null;
-
     return new Promise((resolve) => {
-        const cleanupTracks = () => {
-            if (mediaStream) {
-                for (const track of mediaStream.getTracks()) {
-                    try {
-                        track.stop();
-                    } catch { }
-                }
-                mediaStream = null;
-            }
-            resolve();
-        };
-
-        if (!recorder) {
-            cleanupTracks();
-            return;
+        // 清除定時器
+        if (recordInterval) {
+            clearInterval(recordInterval);
+            recordInterval = null;
         }
 
-        try {
-            if (recorder.state === "inactive") {
-                cleanupTracks();
-                return;
-            }
-
-            recorder.addEventListener(
-                "stop",
-                () => {
-                    // Let the final dataavailable flush first.
-                    window.setTimeout(cleanupTracks, 20);
-                },
-                { once: true },
-            );
-
-            try {
-                recorder.requestData();
-            } catch { }
+        // 停止並銷毀錄音實例，釋放記憶體
+        if (recorder) {
             recorder.stop();
-        } catch {
-            cleanupTracks();
+            recorder.destroy();
+            recorder = null;
+            console.log("🛑 錄音已停止");
         }
+        resolve();
     });
 }
 
@@ -420,15 +384,27 @@ const connectWs = () => {
                     (sum, chunk) => sum + (chunk.size || 0),
                     0,
                 );
+
                 setCallStatus("播放回覆語音");
                 setText(
                     helperTextEl,
                     `TTS 音訊已接收 (${audioSize} bytes)` +
-                    (ttsIncoming.expectedSize
-                        ? ` / 預期 ${ttsIncoming.expectedSize} bytes`
-                        : ""),
+                    (ttsIncoming.expectedSize ? ` / 預期 ${ttsIncoming.expectedSize} bytes` : ""),
                 );
-                playIncomingTts().finally(() => resetIncomingTts());
+
+                // 🌟 修改這裡：使用 async 包起來確保「先播完、再發送」
+                (async () => {
+                    try {
+                        await playIncomingTts(); // 這行會卡住，直到聲音播完
+                    } finally {
+                        // 播完後，才發送 ws 訊息
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            console.log("發送 tts.played 給後端");
+                            ws.send(JSON.stringify({ type: "tts.played" }));
+                        }
+                        resetIncomingTts();
+                    }
+                })();
             }
 
             if (msg.type === "tts.error") {
@@ -448,6 +424,29 @@ const connectWs = () => {
                 console.warn("STT error:", message);
                 setCallStatus("STT 失敗");
                 setText(helperTextEl, `STT 錯誤: ${message}`);
+            }
+
+            if (msg.type === "interrupt") {
+                console.log("🛑 Received interrupt from server");
+                setCallStatus("通話中 (AI 被打斷)");
+                setText(helperTextEl, "偵測到您說話，已停止 AI 回覆");
+
+                // 1. 停止目前正在播放的音訊
+                if (typeof currentAudio !== 'undefined' && currentAudio) {
+                    currentAudio.pause();
+                    currentAudio.currentTime = 0; // 將進度條歸零
+                    currentAudio = null;          // 清除記憶體參考
+                }
+
+                // 2. 重置/清空 TTS 接收緩衝區，把還沒播出來的片段全部丟掉
+                ttsIncoming = {
+                    active: false,
+                    chunks: [],
+                    mime: "audio/webm", // 這裡請對齊你原本的預設格式
+                    ext: ".webm",
+                    expectedSize: 0,
+                };
+                return; // 提早結束，不繼續執行後面的邏輯
             }
         };
     });

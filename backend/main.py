@@ -14,16 +14,16 @@ import logging
 from dotenv import load_dotenv
 import time
 from pydub import AudioSegment
-import webrtcvad
 from pydub.utils import mediainfo
 from langchain_openai import AzureChatOpenAI
 from langchain.agents import create_agent
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-
+import base64
 # ==================== 導入自定義 TTS 模組 ====================
 from tts_handler import TTSProcessor, EdgeTTSProvider, MarkdownCleaner, TTSTextSplitter
 from audio_utils import AudioValidator, AudioProcessor, AudioQualityChecker
 from tts_config import EDGE_TTS_CONFIG, AUDIO_CONFIG, DEFAULTS, validate_config
+from asr import generate_transcription
 
 load_dotenv()
 
@@ -40,15 +40,6 @@ llm = AzureChatOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
 )
 
-GROQ_API_URL = os.getenv(
-    "GROQ_API_URL",
-    "https://api.groq.com/openai/v1/audio/transcriptions"
-)
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    logger.warning("GROQ_API_KEY not found in environment variables")
-
 # === 固定 TTS 音色與輸出格式 ===
 # 音色固定（依需求）：zh-TW-YunJheNeural
 EDGE_TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "zh-TW-YunJheNeural")
@@ -60,10 +51,8 @@ EDGE_TTS_TRY_FORMATS = [
     "audio-16khz-32kbitrate-mono-mp3",
 ]
 
-GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 STT_SILENCE_SECONDS = float(os.getenv("STT_SILENCE_SECONDS", "1.2"))
 STT_MIN_AUDIO_BYTES = int(os.getenv("STT_MIN_AUDIO_BYTES", "2048"))
-VAD_SILENCE_TIMEOUT = float(os.getenv("VAD_SILENCE_TIMEOUT", "1.0")) # 靜音 1 秒視為結束
 VAD_ENERGY_THRESHOLD = int(os.getenv("VAD_ENERGY_THRESHOLD", "-40")) # dBFS 音量閾值 (需視麥克風調整)
 SESSION_CLEANUP_INTERVAL_SECONDS = int(os.getenv("SESSION_CLEANUP_INTERVAL_SECONDS", "600"))
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
@@ -77,8 +66,6 @@ EDGE_TTS_TRY_FORMATS = [
     "audio-24khz-48kbitrate-mono-mp3",
     "audio-16khz-32kbitrate-mono-mp3",
 ]
-
-vad = webrtcvad.Vad(3)
 
 # 相關工具參數引入驗證
 if not validate_config():
@@ -186,7 +173,6 @@ class _HTTPOnlyStaticFiles:
             return
         await self._static_app(scope, receive, send)
 
-
 @dataclass
 class SessionState:
     connected: bool = True
@@ -262,24 +248,25 @@ class SessionManager:
 
         return len(expired_session_ids)
 
-    def store_chunk(self, session_id: uuid.UUID, chunk: bytes, ext: str) -> None:
+    def store_chunk(self, session_id: uuid.UUID, chunk: bytes) -> None:
+        """
+        純 PCM 專用的儲存邏輯：沒有 Header，直接往 Buffer 塞入數據。
+        """
         state = self._get_state(session_id)
-        if not state.audio_header:
-            state.audio_header = chunk
-            state.audio_ext = ext
+        MAX_BUFFER_SIZE = 10 * 1024 * 1024 # 10MB 保護限制
+        
+        if len(state.audio_buffer) + len(chunk) > MAX_BUFFER_SIZE:
+            logger.warning(f"Session {session_id} buffer overflow, clearing silence...")
             state.audio_buffer.clear()
-        else:
-            MAX_BUFFER_SIZE = 10 * 1024 * 1024 
-            if len(state.audio_buffer) + len(chunk) > MAX_BUFFER_SIZE:
-                logger.warning(f"Session {session_id} buffer overflow, clearing silence...")
-                state.audio_buffer.clear()
-            state.audio_buffer.extend(chunk)
+            
+        state.audio_buffer.extend(chunk)
 
-    def get_combined_audio(self, session_id: uuid.UUID) -> tuple[bytes, str]:
+    def get_combined_audio(self, session_id: uuid.UUID) -> bytes:
+        """
+        純 PCM 專用：直接回傳目前的 Buffer，不需要再拼接 Header 了。
+        """
         state = self.sessions.get(session_id)
-        if not state:
-            return b"", ".webm"
-        return state.audio_header + bytes(state.audio_buffer), state.audio_ext
+        return bytes(state.audio_buffer) if state else b""
 
     def clear_audio_buffer(self, session_id: uuid.UUID, size: int = -1) -> None:
         state = self.sessions.get(session_id)
@@ -392,49 +379,6 @@ class SessionManager:
 session_manager = SessionManager()
 session_cleanup_task: Optional[asyncio.Task] = None
 
-
-async def _session_cleanup_loop() -> None:
-    """背景巡檢：定期清理 pause 超過 TTL 的 session。"""
-    while True:
-        await asyncio.sleep(SESSION_CLEANUP_INTERVAL_SECONDS)
-        removed = session_manager.cleanup_expired_sessions(time.time(), SESSION_TTL_SECONDS)
-        if removed > 0:
-            logger.info(
-                f"Session cleanup removed {removed} expired sessions "
-                f"(ttl={SESSION_TTL_SECONDS}s)"
-            )
-
-
-@app.on_event("startup")
-async def _startup_session_cleanup_task() -> None:
-    global session_cleanup_task
-    if session_cleanup_task is None or session_cleanup_task.done():
-        session_cleanup_task = asyncio.create_task(_session_cleanup_loop())
-
-
-@app.on_event("shutdown")
-async def _shutdown_session_cleanup_task() -> None:
-    global session_cleanup_task
-    if session_cleanup_task and not session_cleanup_task.done():
-        session_cleanup_task.cancel()
-        try:
-            await session_cleanup_task
-        except asyncio.CancelledError:
-            pass
-    session_cleanup_task = None
-
-def _guess_container_ext(first_chunk: bytes) -> str:
-    """根據音頻流的第一個塊猜測容器格式，這對於向 GROQ API 發送正確的文件類型很重要。"""
-    # WebM (EBML): 1A 45 DF A3
-    if len(first_chunk) >= 4 and first_chunk[:4] == b"\x1a\x45\xdf\xa3":
-        return ".webm"
-    # Ogg: 'OggS'
-    if len(first_chunk) >= 4 and first_chunk[:4] == b"OggS":
-        return ".ogg"
-    # Fallback: unknown binary container
-    return ".bin"
-
-
 def _guess_mime_by_ext(ext: str) -> str:
     """根據副檔名猜測 MIME 類型，這對於向 GROQ API 發送正確的文件類型很重要。"""
     if ext == ".webm":
@@ -445,19 +389,24 @@ def _guess_mime_by_ext(ext: str) -> str:
         return "audio/mpeg"
     return "application/octet-stream"
 
-
-def _store_stream_chunk(session_id: uuid.UUID, chunk: bytes) -> None:
-    """
-    將接收到的音頻塊存儲在內存中。
-    第一個塊 (Header) 會被獨立保存，後續塊存入 buffer。
-    """
-    session_manager.store_chunk(session_id, chunk, _guess_container_ext(chunk))
-
-
 def _store_tts_chunk(session_id: uuid.UUID, chunk: bytes, ext: str) -> None:
     """將生成的 TTS 音訊分塊存入 session 狀態。"""
     session_manager.store_tts_chunk(session_id, chunk, ext)
 
+def _save_session_audio_snapshot(session_id: uuid.UUID, audio_bytes: bytes, ext: str) -> str:
+    """將本次連線期間的音訊獨立存檔到 temp_audio。"""
+    output_dir = AUDIO_CONFIG.get("temp_dir", "temp_audio")
+    os.makedirs(output_dir, exist_ok=True)
+
+    safe_ext = ext if ext else ".webm"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"{session_id}_{timestamp}{safe_ext}"
+    filepath = os.path.join(output_dir, filename)
+
+    with open(filepath, "wb") as f:
+        f.write(audio_bytes)
+
+    return filepath
 
 def _cache_tts_file_to_session(session_id: uuid.UUID, filepath: str) -> tuple[int, str]:
     """將 TTS 檔案分塊存入 SessionManager，回傳總長度與副檔名。"""
@@ -476,7 +425,6 @@ def _cache_tts_file_to_session(session_id: uuid.UUID, filepath: str) -> tuple[in
 
     combined, stored_ext = session_manager.get_combined_tts_audio(session_id)
     return len(combined), stored_ext
-
 
 async def _send_tts_audio_via_ws(ws: WebSocket, session_id: uuid.UUID) -> None:
     """將 session 中暫存的 TTS 音訊以 binary chunks 經由 WS 回傳前端。"""
@@ -506,79 +454,65 @@ async def _send_tts_audio_via_ws(ws: WebSocket, session_id: uuid.UUID) -> None:
     except (WebSocketDisconnect, RuntimeError):
         # 傳輸中途斷線，安靜處理即可
         pass
-    finally:
-        session_manager.clear_tts_audio_buffer(session_id)
-        session_manager.set_session_llm_speaking(session_id, False)
 
-
-def _transcribe_audio_bytes(audio_bytes: bytes, ext: str, prompt: str = "") -> dict:
-    """將音頻字節發送到 GROQ STT API 進行轉錄，並返回轉錄結果。"""
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY is not configured")
-
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    data = {
-        "model": GROQ_STT_MODEL,
-        "response_format": "verbose_json",
-        "temperature": 0,
-    }
-    cleaned_prompt = (prompt or "").strip()
-    if cleaned_prompt:
-        data["prompt"] = cleaned_prompt[:500]
-
-    filename = f"audio{ext or '.webm'}"
-    bio = io.BytesIO(audio_bytes)
-    files = {
-        "file": (filename, bio, _guess_mime_by_ext(ext)),
-    }
-    logger.info(f"Sending audio to GROQ STT API: {len(audio_bytes)} bytes, ext={ext}, prompt_len={len(cleaned_prompt)}")
-    resp = requests.post(
-        GROQ_API_URL,
-        headers=headers,
-        data=data,
-        files=files,
-        timeout=90,
-    )
-    if not resp.ok:
-        detail = (resp.text or "").strip()
-        raise RuntimeError(f"groq stt failed: {resp.status_code} {detail[:500]}")
-    body = resp.json()
-    if not isinstance(body, dict):
-        raise RuntimeError("unexpected STT response format")
-    text = (body.get("text") or "").strip()
-    logger.info(f"GROQ STT API response: text_len={len(text)}, full_response_keys={list(body.keys())}")
-    logger.info(f"text: {text[:200]}")
+def _transcribe_audio_bytes(audio_bytes: bytes, prompt: str = "") -> dict:
+    logger.info(f"Sending audio to Local ASR: {len(audio_bytes)} bytes")
+    text = generate_transcription(audio_bytes)
+    if not text:
+        logger.warning("Local ASR returned empty text or encountered an error.")
+    logger.info(f"Local STT text: {text[:200]}")    
     return {
         "text": text,
-        "raw": body,
+        "raw": {"text": text, "model": "local-breeze-asr-25"}
     }
 
-def _check_speech_presence(audio_bytes: bytes, ext: str) -> bool:
+def _analyze_speech_state(audio_bytes: bytes) -> tuple[bool, bool]:
     """
-    使用 WebRTC VAD 檢測是否有人類語音特徵，取代單純的音量判定。
+    純 PCM 專用的智慧語音狀態分析
+    回傳值: (is_speaking_now, is_speech_finished)
+    - is_speaking_now: 當下是否有發出聲音 (用於即時打斷 AI)
+    - is_speech_finished: 是否已經講完話並停頓了 1.2 秒 (用於觸發 STT)
     """
+    # === 核心參數設定 ===
+    VAD_THRESHOLD = -40.0  # 噪音門檻 (dBFS)。高於此值視為人聲，可依據麥克風收音狀況調整 (-35.0 到 -45.0)
+    PAUSE_MS = 1200        # 判定講話結束的停頓時間 (毫秒)
+    MIN_SPEECH_MS = 300    # 避免短暫雜音(如咳嗽/敲擊)被當成講話的最短長度
+    
+    # 檢查長度是否足夠基本判斷 (100ms 約為 4800 bytes @ 24kHz, 16bit, 單聲道)
+    if len(audio_bytes) < 4800:
+        return False, False
+        
     try:
-        # 1. 解碼音訊並強制轉換為 WebRTC 要求的格式 (16kHz, 單聲道, 16-bit)
-        audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format=ext.replace('.', ''))
-        audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+        # 將純二進位轉換為 PyDub AudioSegment
+        audio = AudioSegment(data=audio_bytes, sample_width=2, frame_rate=24000, channels=1)
+        total_ms = len(audio)
+        recent_audio = audio[-100:]
+        is_speaking_now = recent_audio.max_dBFS >= VAD_THRESHOLD
+        
+        # 2. 判斷「是否已經講完且停頓」
+        is_speech_finished = False
+        
+        # 緩衝區必須大於 (停頓時間 + 最短說話時間) 才有判斷價值
+        if total_ms >= (PAUSE_MS + MIN_SPEECH_MS):
+            # 取得最後 1.2 秒的停頓區段
+            trailing_audio = audio[-PAUSE_MS:]
+            # 取得 1.2 秒之前的實際發聲區段
+            speaking_audio = audio[:-PAUSE_MS]
+            
+            # 條件 A: 最後 1.2 秒的峰值音量，是不是都低於環境音門檻？ (確實停頓了)
+            is_paused = trailing_audio.max_dBFS < VAD_THRESHOLD
+            
+            # 條件 B: 停頓之前，是不是真的有講話？ (避免長時間沒講話的純底噪累積觸發 STT)
+            has_spoken_before = speaking_audio.max_dBFS >= VAD_THRESHOLD
+            
+            if is_paused and has_spoken_before:
+                is_speech_finished = True
 
-        # 2. 確保音訊長度大於 30 毫秒 (WebRTC 支援 10, 20, 30ms 的 frames)
-        if len(audio) < 30:
-            return False
-
-        # 3. 取得最後 30 毫秒的音訊特徵來判斷當下是否在說話
-        recent_audio = audio[-30:]
-        raw_data = recent_audio.raw_data
-
-        # 4. 驗證 bytes 長度 (16000 Hz * 2 bytes * 0.03 sec = 960 bytes)
-        if len(raw_data) == 960:
-            # 檢測其中是否有人聲頻率
-            return vad.is_speech(raw_data, 16000)
-
-        return False
+        return is_speaking_now, is_speech_finished
+        
     except Exception as e:
-        logger.debug(f"WebRTC VAD parsing warning: {e}")
-        return False
+        logger.error(f"Speech analysis error: {e}", exc_info=True)
+        return False, False
 
 def _llm_respond(session_id: uuid.UUID, text: str) -> str:
     """
@@ -612,16 +546,16 @@ async def _safe_ws_send(ws: WebSocket, payload: dict) -> None:
 async def _process_ai_pipeline(
     ws: WebSocket, 
     session_id: uuid.UUID, 
-    audio_bytes: bytes, 
-    ext: str, 
+    audio_bytes: bytes,
     combined_prompt: str, 
     system_prompt: str,
     current_buffer_size: int
 ) -> None:
     try:
+        logger.info(f"Starting AI pipeline for session {session_id} with audio size {len(audio_bytes)} bytes and prompt length {len(combined_prompt)}")
         # === 1. STT 階段 ===
         session_manager.set_session_llm_speaking(session_id, True)
-        result = await asyncio.to_thread(_transcribe_audio_bytes, audio_bytes, ext, combined_prompt)
+        result = await asyncio.to_thread(_transcribe_audio_bytes, audio_bytes, combined_prompt)
         text = result.get("text", "").strip()
         
         session_manager.set_prompt_context(session_id, text)
@@ -639,6 +573,8 @@ async def _process_ai_pipeline(
         llm_text = await asyncio.to_thread(_llm_respond, session_id, text)
         if not llm_text:
             await _safe_ws_send(ws, {"type": "llm.error", "session": str(session_id), "message": "empty llm response"})
+            logger.error(f"LLM returned empty response for session {session_id}")
+            session_manager.set_session_llm_speaking(session_id, False)
             return
             
         await _safe_ws_send(ws, {"type": "llm.result", "session": str(session_id), "text": llm_text})
@@ -665,46 +601,53 @@ async def _process_ai_pipeline(
     except Exception as e:
         logger.error(f"Pipeline failed for session {session_id}: {e}")
         await _safe_ws_send(ws, {"type": "error", "session": str(session_id), "message": str(e)})
+        session_manager.set_session_llm_speaking(session_id, False)
 
 async def _vad_stt_loop(ws: WebSocket, session_id: uuid.UUID, system_prompt: str) -> None:
     """
-    取代原本的 _periodic_stt_loop。
-    以高頻率 (0.1s) 監控音頻狀態，基於人類行為學參數決定何時觸發 STT。
+    以高頻率 (0.25s) 監控音頻狀態，基於聲波能量精準決定何時觸發 STT 與打斷。
     """
+
     while True:
-        await asyncio.sleep(0.25)  # 高頻輪詢狀態
+        await asyncio.sleep(0.25)
 
         buffer_size = session_manager.get_buffer_size(session_id)
         if buffer_size < STT_MIN_AUDIO_BYTES:
             continue
 
-        audio_bytes, ext = session_manager.get_combined_audio(session_id)
-
-        # 1. 檢測這段音訊內有沒有人類說話的能量
-        has_speech = await asyncio.to_thread(_check_speech_presence, audio_bytes, ext)
+        audio_bytes = session_manager.get_combined_audio(session_id)
+        is_speaking_now, is_speech_finished = await asyncio.to_thread(_analyze_speech_state, audio_bytes)
+        
         current_time = time.time()
-
-        if has_speech:
-            # 狀態更新：正在說話，更新最後說話時間
-            session_manager.mark_speaking(session_id, current_time)
-            continue # 繼續累積音頻，不送 STT
-
-        is_speaking, last_speech = session_manager.get_vad_state(session_id, current_time)
-        silence_duration = current_time - last_speech
-        current_buffer_size = session_manager.get_buffer_size(session_id)
         llm_speaking = session_manager.get_session_llm_speaking(session_id)
-        if is_speaking and silence_duration >= VAD_SILENCE_TIMEOUT and not llm_speaking:
-            session_manager.reset_speaking(session_id)
 
+        # 🎯 情況 A：使用者「正在講話」
+        if is_speaking_now:
+            logger.info(f"Session {session_id} detected speech presence, buffer size: {buffer_size} bytes")
+            session_manager.mark_speaking(session_id, current_time)
+
+            if llm_speaking:
+                logger.info(f"偵測到人聲！觸發打斷 (Session: {session_id})")
+                session_manager.clear_tts_audio_buffer(session_id)
+                session_manager.clear_audio_buffer(session_id)
+                session_manager.set_session_llm_speaking(session_id, False)
+                await _safe_ws_send(ws, {"type": "interrupt", "session": str(session_id)})
+            continue # 還在講話，繼續收集聲音，跳過這回合
+
+        # 🎯 情況 B：使用者「講完且停頓」，且 AI 沒在說話
+        if is_speech_finished and not llm_speaking:
+            session_manager.reset_speaking(session_id)
+            current_buffer_size = session_manager.get_buffer_size(session_id)
+            
             await _safe_ws_send(ws, {"type": "stt.started", "session": str(session_id)})
 
             context_text = session_manager.get_prompt_context(session_id)
             combined_prompt = f"{system_prompt} {context_text}".strip()
 
-            asyncio.create_task(
-                _process_ai_pipeline(
-                    ws, session_id, audio_bytes, ext, combined_prompt, system_prompt, current_buffer_size
-                )
+            logger.info(f"確定停頓滿 1.2 秒，送出長度 {current_buffer_size} bytes 音訊至 STT")
+
+            await _process_ai_pipeline(
+                ws, session_id, audio_bytes, combined_prompt, system_prompt, current_buffer_size
             )
 
 async def _ws_loop(ws: WebSocket, session_id: uuid.UUID, system_prompt: str) -> None:
@@ -728,18 +671,19 @@ async def _ws_loop(ws: WebSocket, session_id: uuid.UUID, system_prompt: str) -> 
                     break
                 raise
 
-            msg_type = message.get("type")
-            if msg_type == "websocket.disconnect":
+            msg_type_ws = message.get("type")
+            if msg_type_ws == "websocket.disconnect":
                 break
 
             data_bytes = message.get("bytes")
             data_text = message.get("text")
-            # 優先處理二進位數據，因為前端會以二進位格式發送音頻塊。
+            
+            # 🎤 1. 處理純 PCM 二進位數據 (前端 ws.send(pcmData) 會走到這裡)
             if isinstance(data_bytes, (bytes, bytearray)):
-                # 將接收到的音頻塊存儲在內存中，STT 由固定週期任務處理。
-                _store_stream_chunk(session_id, bytes(data_bytes))
+                session_manager.store_chunk(session_id, bytes(data_bytes))
                 continue
 
+            # 如果不是二進位，也不是文字，就跳過
             if not isinstance(data_text, str):
                 continue
 
@@ -748,15 +692,30 @@ async def _ws_loop(ws: WebSocket, session_id: uuid.UUID, system_prompt: str) -> 
             except json.JSONDecodeError:
                 await _safe_ws_send(ws, {"type": "error", "message": "invalid json"})
                 continue
-            # 處理 ping 消息，回應 pong
-            if isinstance(msg, dict) and msg.get("type") == "ping":
-                await _safe_ws_send(ws, {"type": "pong", "session": str(session_id), "ts": datetime.now().isoformat()})
-                continue
+            
+            if isinstance(msg, dict):
+                msg_type = msg.get("type")
+                if msg_type == "ping":
+                    await _safe_ws_send(ws, {"type": "pong", "session": str(session_id), "ts": datetime.now().isoformat()})
+                    continue
+                elif msg_type == "tts.played":
+                    logger.info(f"Received TTS played confirmation, clearing ALL buffers")
+                    session_manager.clear_tts_audio_buffer(session_id) # 清空輸出的語音
+                    session_manager.clear_audio_buffer(session_id)     # 🌟 新增：清空錄進去的回音緩衝！
+                    session_manager.set_session_llm_speaking(session_id, False)
 
     except WebSocketDisconnect:
         logger.warning(f"WebSocket disconnected: session {session_id} closed")
+        
     finally:
-        # session_manager.closeSession(session_id)
+        # 🌟 斷線時的清理與存檔工作
+        audio_bytes = session_manager.get_combined_audio(session_id)
+        if audio_bytes:
+            # 存檔時直接指定為 .pcm 副檔名
+            saved_path = _save_session_audio_snapshot(session_id, audio_bytes, ".pcm")
+            logger.info(f"Saved session audio snapshot: {saved_path}")
+            
+        # 暫停 session 以防記憶體洩漏 (Memory Leak)
         session_manager.pause_session(session_id)
         logger.info(f"Active sessions: {len(session_manager.sessions)}")
 
@@ -800,7 +759,6 @@ async def ws_existing_session(ws: WebSocket, session_id: str) -> None:
         await ws.close(code=1008)
         return
     await _ws_loop(ws, uid, system_prompt)
-
 
 # 掛載 frontend 資料夾為根目錄
 app.mount("/", _HTTPOnlyStaticFiles(StaticFiles(directory="../frontend", html=True)), name="frontend")
